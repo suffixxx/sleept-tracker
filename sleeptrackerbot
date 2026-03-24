@@ -1,0 +1,745 @@
+import asyncio
+import sqlite3
+import random
+from datetime import datetime, timedelta, date
+from contextlib import closing
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# ========== НАСТРОЙКИ ==========
+API_TOKEN = '8712577551:AAFQc34R2vaIhl-vQvyGc7FTOxLr0I_7VNA'
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+scheduler = AsyncIOScheduler()
+DB_NAME = 'sleep_bot.db'
+
+# ========== СОСТОЯНИЯ ДЛЯ ОПРОСОВ ==========
+class MorningSurvey(StatesGroup):
+    sleep_quality = State()      # качество сна 1-10
+    wake_difficulty = State()    # сложность подъема 1-10
+
+class EveningSurvey(StatesGroup):
+    physical_activity = State()  # физ активность 1-10
+    fatigue_stress = State()     # усталость/стресс 1-10
+
+class WeeklySports(StatesGroup):
+    discipline = State()         # название дисциплины
+    value = State()              # результат
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            # Пользователи
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reminder_time TEXT DEFAULT '21:00'
+                )
+            ''')
+            
+            # Сессии сна (таймер)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS sleep_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    sleep_start TIMESTAMP,
+                    sleep_end TIMESTAMP,
+                    duration_hours REAL,
+                    date DATE,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id)
+                )
+            ''')
+            
+            # Утренние оценки
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS morning_ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    date DATE NOT NULL,
+                    sleep_quality INTEGER,      -- 1-10
+                    wake_difficulty INTEGER,    -- 1-10
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, date)
+                )
+            ''')
+            
+            # Вечерние оценки
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS evening_ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    date DATE NOT NULL,
+                    physical_activity INTEGER,  -- 1-10
+                    fatigue_stress INTEGER,     -- 1-10
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, date)
+                )
+            ''')
+            
+            # Спортивные показатели (раз в неделю)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS sports_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    week_start DATE NOT NULL,
+                    discipline TEXT NOT NULL,
+                    value REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+def register_user(user_id: int, username: str):
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            conn.execute(
+                'INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)',
+                (user_id, username)
+            )
+
+# ========== РАБОТА СО СНОМ (ТАЙМЕР) ==========
+def start_sleep_session(user_id: int):
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            conn.execute(
+                'DELETE FROM sleep_sessions WHERE user_id = ? AND sleep_end IS NULL',
+                (user_id,)
+            )
+            conn.execute('''
+                INSERT INTO sleep_sessions (user_id, sleep_start, date)
+                VALUES (?, ?, ?)
+            ''', (user_id, datetime.now(), datetime.now().date()))
+
+def end_sleep_session(user_id: int):
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            cur = conn.execute('''
+                SELECT id, sleep_start FROM sleep_sessions
+                WHERE user_id = ? AND sleep_end IS NULL
+                ORDER BY sleep_start DESC LIMIT 1
+            ''', (user_id,))
+            session = cur.fetchone()
+            
+            if session:
+                session_id, start_time = session
+                start_time = datetime.fromisoformat(start_time)
+                end_time = datetime.now()
+                duration = (end_time - start_time).total_seconds() / 3600
+                
+                conn.execute('''
+                    UPDATE sleep_sessions
+                    SET sleep_end = ?, duration_hours = ?
+                    WHERE id = ?
+                ''', (end_time, duration, session_id))
+                
+                return duration
+    return None
+
+# ========== СОХРАНЕНИЕ ОЦЕНОК ==========
+def save_morning_rating(user_id: int, date_obj: date, quality: int, difficulty: int):
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO morning_ratings (user_id, date, sleep_quality, wake_difficulty)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, date_obj.isoformat(), quality, difficulty))
+
+def save_evening_rating(user_id: int, date_obj: date, activity: int, fatigue: int):
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO evening_ratings (user_id, date, physical_activity, fatigue_stress)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, date_obj.isoformat(), activity, fatigue))
+
+def save_sports_result(user_id: int, discipline: str, value: float):
+    """Сохраняет спортивный результат за текущую неделю"""
+    today = date.today()
+    # Находим начало недели (понедельник)
+    week_start = today - timedelta(days=today.weekday())
+    
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        with conn:
+            conn.execute('''
+                INSERT INTO sports_results (user_id, week_start, discipline, value)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, week_start.isoformat(), discipline, value))
+
+# ========== ПОЛУЧЕНИЕ СТАТИСТИКИ ==========
+def get_weekly_stats(user_id: int, days: int = 7):
+    """Получает статистику за последние N дней"""
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        conn.row_factory = sqlite3.Row
+        
+        # Утренние оценки
+        morning = conn.execute('''
+            SELECT sleep_quality, wake_difficulty, date
+            FROM morning_ratings
+            WHERE user_id = ? AND date >= date('now', ?)
+            ORDER BY date DESC
+        ''', (user_id, f'-{days} days')).fetchall()
+        
+        # Вечерние оценки
+        evening = conn.execute('''
+            SELECT physical_activity, fatigue_stress, date
+            FROM evening_ratings
+            WHERE user_id = ? AND date >= date('now', ?)
+            ORDER BY date DESC
+        ''', (user_id, f'-{days} days')).fetchall()
+        
+        # Данные о сне
+        sleep = conn.execute('''
+            SELECT duration_hours, date
+            FROM sleep_sessions
+            WHERE user_id = ? AND sleep_end IS NOT NULL
+              AND date >= date('now', ?)
+            ORDER BY date DESC
+        ''', (user_id, f'-{days} days')).fetchall()
+        
+        return {
+            'morning': morning,
+            'evening': evening,
+            'sleep': sleep,
+            'days': len(set([r['date'] for r in morning]))
+        }
+
+def get_sports_history(user_id: int):
+    """Получает историю спортивных результатов"""
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute('''
+            SELECT discipline, value, week_start
+            FROM sports_results
+            WHERE user_id = ?
+            ORDER BY week_start DESC, discipline
+        ''', (user_id,))
+        return cur.fetchall()
+
+def get_last_two_weeks_sports(user_id: int, discipline: str):
+    """Получает результаты за последние две недели для конкретной дисциплины"""
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        cur = conn.execute('''
+            SELECT value, week_start
+            FROM sports_results
+            WHERE user_id = ? AND discipline = ?
+            ORDER BY week_start DESC
+            LIMIT 2
+        ''', (user_id, discipline))
+        return cur.fetchall()
+
+# ========== КЛАВИАТУРА ==========
+def get_main_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="😴 Лечь спать")],
+            [KeyboardButton(text="🌞 Я проснулся")],
+            [KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="💪 Записать результат")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def get_rating_keyboard():
+    """Клавиатура для оценок 1-10"""
+    buttons = []
+    row = []
+    for i in range(1, 11):
+        row.append(KeyboardButton(text=str(i)))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
+
+# ========== ХЕНДЛЕРЫ ==========
+@dp.message(Command('start'))
+async def cmd_start(message: Message):
+    user = message.from_user
+    register_user(user.id, user.username)
+    
+    await message.answer(
+        "🌙 *Трекер сна и восстановления*\n\n"
+        "Я помогаю отслеживать сон, самочувствие и спортивные результаты!\n\n"
+        "📝 *Как пользоваться:*\n"
+        "1️⃣ Нажми *«😴 Лечь спать»* перед сном\n"
+        "2️⃣ Нажми *«🌞 Я проснулся»* утром и ответь на вопросы\n"
+        "3️⃣ Вечером я сам спрошу про твой день\n"
+        "4️⃣ Раз в неделю записывай спортивные результаты\n\n"
+        "Готов? Начинай прямо сейчас! 👇",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(lambda msg: msg.text == "😴 Лечь спать")
+async def sleep_start(message: Message):
+    user_id = message.from_user.id
+    
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        cur = conn.execute('''
+            SELECT 1 FROM sleep_sessions 
+            WHERE user_id = ? AND sleep_end IS NULL
+        ''', (user_id,))
+        if cur.fetchone():
+            await message.answer("❌ У тебя уже есть активная сессия сна!")
+            return
+    
+    start_sleep_session(user_id)
+    
+    # Советы перед сном
+    tips = [
+        "💡 *Совет:* Проветри комнату перед сном, это улучшит качество сна!",
+        "💡 *Совет:* Не ешь за 2-3 часа до сна",
+        "💡 *Совет:* Убери телефон за час до сна — синий свет мешает засыпанию",
+        "💡 *Совет:* Прими теплый душ — это расслабляет мышцы"
+    ]
+    
+    await message.answer(
+        f"😴 *Спокойной ночи!*\n\n"
+        f"Я начал отсчёт времени сна.\n"
+        f"{random.choice(tips)}\n\n"
+        f"Не забудь нажать *«🌞 Я проснулся»* когда встанешь!",
+        parse_mode="Markdown"
+    )
+
+@dp.message(lambda msg: msg.text == "🌞 Я проснулся")
+async def sleep_end(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    duration = end_sleep_session(user_id)
+    
+    if duration is None:
+        await message.answer(
+            "❌ Не найдено активной сессии сна!\n"
+            "Нажми *«😴 Лечь спать»* перед сном.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    hours = int(duration)
+    minutes = int((duration - hours) * 60)
+    
+    await message.answer(
+        f"🌞 *Доброе утро!*\n\n"
+        f"Ты спал: *{hours} ч {minutes} мин*\n\n"
+        f"📝 Теперь короткий опрос:",
+        parse_mode="Markdown"
+    )
+    
+    await message.answer(
+        "💤 *Оцени качество сна* (1-10)\n\n"
+        "1 - очень плохо, постоянно просыпался\n"
+        "10 - отлично, глубокий сон",
+        reply_markup=get_rating_keyboard(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(MorningSurvey.sleep_quality)
+    await state.update_data(duration=duration)
+
+@dp.message(MorningSurvey.sleep_quality)
+async def process_sleep_quality(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1 or int(message.text) > 10:
+        await message.answer("❌ Введи число от 1 до 10")
+        return
+    
+    await state.update_data(sleep_quality=int(message.text))
+    await message.answer(
+        "⏰ *Сложность подъема* (1-10)\n\n"
+        "1 - очень легко встал\n"
+        "10 - очень тяжело, хотелось спать",
+        reply_markup=get_rating_keyboard(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(MorningSurvey.wake_difficulty)
+
+@dp.message(MorningSurvey.wake_difficulty)
+async def process_wake_difficulty(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1 or int(message.text) > 10:
+        await message.answer("❌ Введи число от 1 до 10")
+        return
+    
+    data = await state.get_data()
+    save_morning_rating(
+        message.from_user.id,
+        date.today(),
+        data['sleep_quality'],
+        int(message.text)
+    )
+    
+    # Рекомендация
+    hours = int(data['duration'])
+    minutes = int((data['duration'] - hours) * 60)
+    
+    advice = ""
+    if data['duration'] < 7:
+        advice = "\n\n⚠️ *Рекомендация:* Ты спал меньше 7 часов. Постарайся ложиться раньше!"
+    elif data['sleep_quality'] <= 3:
+        advice = "\n\n⚠️ *Рекомендация:* Качество сна низкое. Попробуй:\n• Проветрить комнату\n• Не есть перед сном\n• Убрать телефон за час"
+    else:
+        advice = "\n\n✅ *Отлично!* Хороший сон — залог продуктивного дня!"
+    
+    await message.answer(
+        f"✅ *Утренний опрос завершен!*\n\n"
+        f"💤 Сон: {hours}ч {minutes}мин\n"
+        f"🎯 Качество сна: {data['sleep_quality']}/10\n"
+        f"⏰ Подъем: {message.text}/10"
+        f"{advice}",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+@dp.message(lambda msg: msg.text == "💪 Записать результат")
+async def sports_start(message: Message, state: FSMContext):
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Подтягивания (раз)")],
+            [KeyboardButton(text="Отжимания (раз)")],
+            [KeyboardButton(text="Приседания (раз)")],
+            [KeyboardButton(text="Прыжок в длину (см)")],
+            [KeyboardButton(text="Бег (мин/км)")],
+            [KeyboardButton(text="Отмена")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer(
+        "💪 *Выбери дисциплину:*",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await state.set_state(WeeklySports.discipline)
+
+@dp.message(WeeklySports.discipline)
+async def process_sports_discipline(message: Message, state: FSMContext):
+    if message.text == "Отмена":
+        await message.answer("❌ Отменено", reply_markup=get_main_keyboard())
+        await state.clear()
+        return
+    
+    disciplines = ["Подтягивания (раз)", "Отжимания (раз)", "Приседания (раз)", 
+                   "Прыжок в длину (см)", "Бег (мин/км)"]
+    
+    if message.text not in disciplines:
+        await message.answer("❌ Выбери дисциплину из списка")
+        return
+    
+    await state.update_data(discipline=message.text)
+    await message.answer(
+        f"📊 Введи результат для *{message.text}*:",
+        reply_markup=types.ReplyKeyboardRemove(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(WeeklySports.value)
+
+@dp.message(WeeklySports.value)
+async def process_sports_value(message: Message, state: FSMContext):
+    try:
+        value = float(message.text.replace(',', '.'))
+        data = await state.get_data()
+        
+        save_sports_result(message.from_user.id, data['discipline'], value)
+        
+        # Сравнение с прошлым результатом
+        last_results = get_last_two_weeks_sports(message.from_user.id, data['discipline'])
+        comparison = ""
+        if len(last_results) >= 2:
+            prev_value = last_results[1][0]
+            diff = value - prev_value
+            if diff > 0:
+                comparison = f"\n📈 *Прогресс:* +{diff:.1f} 🎉"
+            elif diff < 0:
+                comparison = f"\n📉 *Спад:* {diff:.1f}"
+            else:
+                comparison = f"\n🤝 Без изменений"
+        
+        await message.answer(
+            f"✅ *Результат сохранен!*\n"
+            f"🏆 {data['discipline']}: {value}{comparison}\n\n"
+            f"Следующий результат записывай через неделю!",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Введи число (например, 15 или 210.5)")
+
+@dp.message(lambda msg: msg.text == "📊 Статистика")
+async def show_stats(message: Message):
+    user_id = message.from_user.id
+    stats = get_weekly_stats(user_id, 7)
+    sports = get_sports_history(user_id)
+    
+    stats_text = "📊 *НЕДЕЛЬНАЯ СТАТИСТИКА*\n\n"
+    
+    # Сон
+    if stats['sleep']:
+        total_sleep = sum(s['duration_hours'] for s in stats['sleep'])
+        avg_sleep = total_sleep / len(stats['sleep'])
+        stats_text += f"😴 *Сон:*\n"
+        stats_text += f"   Средняя длительность: {avg_sleep:.1f} ч\n"
+        stats_text += f"   Дней с данными: {len(stats['sleep'])}\n\n"
+    else:
+        stats_text += "😴 *Сон:* Нет данных\n\n"
+    
+    # Утренние оценки
+    if stats['morning']:
+        avg_quality = sum(m['sleep_quality'] for m in stats['morning']) / len(stats['morning'])
+        avg_difficulty = sum(m['wake_difficulty'] for m in stats['morning']) / len(stats['morning'])
+        stats_text += f"🌅 *Утро:*\n"
+        stats_text += f"   Качество сна: {avg_quality:.1f}/10\n"
+        stats_text += f"   Сложность подъема: {avg_difficulty:.1f}/10\n\n"
+    
+    # Вечерние оценки
+    if stats['evening']:
+        avg_activity = sum(e['physical_activity'] for e in stats['evening']) / len(stats['evening'])
+        avg_fatigue = sum(e['fatigue_stress'] for e in stats['evening']) / len(stats['evening'])
+        stats_text += f"🌙 *День:*\n"
+        stats_text += f"   Физическая активность: {avg_activity:.1f}/10\n"
+        stats_text += f"   Усталость/стресс: {avg_fatigue:.1f}/10\n\n"
+    
+    # Спортивные результаты
+    if sports:
+        stats_text += f"💪 *Спортивные результаты (последние):*\n"
+        # Группируем по дисциплинам
+        disciplines = {}
+        for s in sports[:5]:
+            if s['discipline'] not in disciplines:
+                disciplines[s['discipline']] = []
+            disciplines[s['discipline']].append(s)
+        
+        for disc, results in list(disciplines.items())[:3]:
+            stats_text += f"   • {disc}: {results[0]['value']}"
+            if len(results) > 1:
+                diff = results[0]['value'] - results[1]['value']
+                if diff > 0:
+                    stats_text += f" (+{diff:.1f}) 📈"
+                elif diff < 0:
+                    stats_text += f" ({diff:.1f}) 📉"
+            stats_text += "\n"
+    
+    # Общие рекомендации
+    stats_text += "\n💡 *Рекомендации:*\n"
+    if stats['morning'] and avg_quality < 6:
+        stats_text += "• Качество сна низкое. Улучши гигиену сна\n"
+    if stats['sleep'] and avg_sleep < 7:
+        stats_text += "• Ты мало спишь. Старайся спать 7-8 часов\n"
+    if stats['evening'] and avg_activity < 4:
+        stats_text += "• Низкая физическая активность. Добавь движение в день\n"
+    if not stats['morning'] and not stats['sleep']:
+        stats_text += "• Начни отслеживать сон с кнопки «😴 Лечь спать»\n"
+    
+    await message.answer(stats_text, parse_mode="Markdown")
+
+# ========== ВЕЧЕРНИЙ ОПРОС ==========
+async def evening_survey(user_id: int, state: FSMContext):
+    """Запускает вечерний опрос"""
+    await bot.send_message(
+        user_id,
+        "🌙 *Вечерний опрос*\n\n"
+        "Как прошел твой день?\n\n"
+        "💪 *Оцени физическую активность* (1-10)\n\n"
+        "1 - совсем не двигался\n"
+        "10 - очень активный день",
+        reply_markup=get_rating_keyboard(),
+        parse_mode="Markdown"
+    )
+    # Сохраняем состояние в FSM (нужно будет доработать для работы с разными пользователями)
+    await state.set_state(EveningSurvey.physical_activity)
+    await state.update_data(user_id=user_id)
+
+@dp.message(EveningSurvey.physical_activity)
+async def process_physical_activity(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1 or int(message.text) > 10:
+        await message.answer("❌ Введи число от 1 до 10")
+        return
+    
+    await state.update_data(physical_activity=int(message.text))
+    await message.answer(
+        "😓 *Оцени уровень усталости и стресса* (1-10)\n\n"
+        "1 - полный покой, расслаблен\n"
+        "10 - сильная усталость, высокий стресс",
+        reply_markup=get_rating_keyboard(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(EveningSurvey.fatigue_stress)
+
+@dp.message(EveningSurvey.fatigue_stress)
+async def process_fatigue_stress(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1 or int(message.text) > 10:
+        await message.answer("❌ Введи число от 1 до 10")
+        return
+    
+    data = await state.get_data()
+    save_evening_rating(
+        message.from_user.id,
+        date.today(),
+        data['physical_activity'],
+        int(message.text)
+    )
+    
+    # Советы на основе данных
+    advice = ""
+    if data['physical_activity'] <= 3:
+        advice = "\n\n💡 *Совет:* Завтра постарайся больше двигаться!"
+    elif int(message.text) >= 8:
+        advice = "\n\n💡 *Совет:* Ты сильно устал. Хорошо отдохни и ложись спать пораньше."
+    
+    await message.answer(
+        f"✅ *Вечерний опрос завершен!*\n\n"
+        f"💪 Активность: {data['physical_activity']}/10\n"
+        f"😓 Усталость/стресс: {message.text}/10"
+        f"{advice}\n\n😴 Спокойной ночи!",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+# ========== НАПОМИНАНИЯ И РАССЫЛКИ ==========
+async def send_sleep_reminders():
+    """Отправляет напоминания о сне и гигиене в 21:00"""
+    tips = [
+        "💡 *Совет по гигиене сна:*\nПроветри комнату перед сном — свежий воздух помогает быстрее заснуть! 🌬️",
+        "💡 *Совет по гигиене сна:*\nПрими теплый душ за час до сна — это расслабляет мышцы и улучшает качество сна 🚿",
+        "💡 *Совет по гигиене сна:*\nУбери телефон за 30-60 минут до сна. Синий свет от экранов мешает выработке мелатонина 📱❌",
+        "💡 *Совет по гигиене сна:*\nНе ешь за 2-3 часа до сна. Тяжелая пища мешает засыпанию 🍔❌",
+        "💡 *Совет по гигиене сна:*\nЛожись спать в одно и то же время — это улучшает циркадные ритмы ⏰",
+        "💡 *Совет по гигиене сна:*\nТемпература в комнате 18-20°C — идеальна для здорового сна 🌡️",
+        "💡 *Совет по гигиене сна:*\nВыпей травяной чай (ромашка, мелисса) перед сном — это успокаивает 🍵"
+    ]
+    
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        cur = conn.execute('SELECT user_id FROM users')
+        users = cur.fetchall()
+    
+    for user_id in users:
+        try:
+            tip = random.choice(tips)
+            await bot.send_message(
+                user_id[0],
+                f"🌙 *Напоминание о сне!*\n\n{tip}\n\n"
+                f"Не забудь нажать *«😴 Лечь спать»* когда будешь ложиться!\n"
+                f"А после пробуждения тебя ждет короткий опрос 😊",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Ошибка отправки {user_id[0]}: {e}")
+
+async def weekly_sports_reminder():
+    """Еженедельное напоминание записать спортивные результаты"""
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        cur = conn.execute('SELECT user_id FROM users')
+        users = cur.fetchall()
+    
+    for user_id in users:
+        try:
+            await bot.send_message(
+                user_id[0],
+                "💪 *Еженедельное напоминание!*\n\n"
+                "Пора записать спортивные результаты за эту неделю.\n"
+                "Нажми кнопку *«💪 Записать результат»* в меню.\n\n"
+                "Отслеживай свой прогресс! 🚀",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Ошибка отправки {user_id[0]}: {e}")
+
+async def weekly_report():
+    """Еженедельная статистика и рекомендации"""
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        cur = conn.execute('SELECT user_id FROM users')
+        users = cur.fetchall()
+    
+    for user_id in users:
+        try:
+            uid = user_id[0]
+            stats = get_weekly_stats(uid, 7)
+            
+            report = "📊 *ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ*\n\n"
+            
+            if stats['sleep']:
+                avg_sleep = sum(s['duration_hours'] for s in stats['sleep']) / len(stats['sleep'])
+                report += f"😴 Средний сон: {avg_sleep:.1f} ч\n"
+                
+                if avg_sleep < 7:
+                    report += "   ⚠️ Спи больше! 7-8 часов необходимо для восстановления\n"
+                elif avg_sleep > 9:
+                    report += "   💪 Хорошее восстановление!\n"
+                else:
+                    report += "   ✅ Отлично! Норма сна соблюдена\n"
+            
+            if stats['morning']:
+                avg_quality = sum(m['sleep_quality'] for m in stats['morning']) / len(stats['morning'])
+                report += f"🎯 Качество сна: {avg_quality:.1f}/10\n"
+                
+                if avg_quality < 5:
+                    report += "   ⚠️ Попробуй улучшить гигиену сна\n"
+            
+            if stats['evening']:
+                avg_fatigue = sum(e['fatigue_stress'] for e in stats['evening']) / len(stats['evening'])
+                report += f"😓 Уровень стресса: {avg_fatigue:.1f}/10\n"
+                
+                if avg_fatigue > 7:
+                    report += "   ⚠️ Высокий стресс. Найди время для отдыха\n"
+            
+            report += "\n🎯 *Цель на следующую неделю:*\n"
+            report += "• Ложись спать до 23:00\n"
+            report += "• Записывай спортивные результаты\n"
+            report += "• Следи за качеством сна\n"
+            
+            await bot.send_message(uid, report, parse_mode="Markdown")
+            
+        except Exception as e:
+            print(f"Ошибка отправки отчета {user_id[0]}: {e}")
+
+# ========== НАСТРОЙКА ПЛАНИРОВЩИКА ==========
+def setup_scheduler():
+    # Ежедневное напоминание о сне в 21:00
+    scheduler.add_job(
+        send_sleep_reminders,
+        trigger='cron',
+        hour=21,
+        minute=0,
+        timezone='Asia/Yekaterinburg'
+    )
+    
+    # Еженедельное напоминание о спортивных результатах (воскресенье в 19:00)
+    scheduler.add_job(
+        weekly_sports_reminder,
+        trigger='cron',
+        day_of_week='sun',
+        hour=19,
+        minute=0,
+        timezone='Asia/Yekaterinburg'
+    )
+    
+    # Еженедельный отчет (воскресенье в 20:00)
+    scheduler.add_job(
+        weekly_report,
+        trigger='cron',
+        day_of_week='sun',
+        hour=20,
+        minute=0,
+        timezone='Asia/Yekaterinburg'
+    )
+    
+    scheduler.start()
+
+# ========== ЗАПУСК ==========
+async def main():
+    init_db()
+    setup_scheduler()
+    print("🤖 Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == '__main__':
+    asyncio.run(main())
